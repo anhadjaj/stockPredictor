@@ -45,7 +45,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nifty 50 AI | Institutional Grade Predictor</title>
+    <title>StocksPro</title>
     <style>
         :root {
             --bg-main: #0a0e17;
@@ -535,7 +535,7 @@ class IntradayNiftyPredictor:
         
         # EXACT PARAMS FROM PROVIDED CODE
         self.lgb_params = {
-            'n_estimators': 1000,   # You explicitly asked to maintain accuracy/logic
+            'n_estimators': 100,   # You explicitly asked to maintain accuracy/logic
             'learning_rate': 0.05,
             'num_leaves': 64,
             'objective': 'regression',
