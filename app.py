@@ -10,7 +10,8 @@ import matplotlib.pyplot as plt
 # ==========================================
 import numpy as np
 import pandas as pd
-import yfinance as yfimport base64
+import yfinance as yf
+import base64
 import io
 import time
 import warnings
