@@ -24,15 +24,16 @@ import requests
 from textblob import TextBlob
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
+# Add these specific Technical Analysis imports
 try:
-    import pandas_ta as ta
-    from ta.trend import EMAIndicator
+    from ta.trend import EMAIndicator, MACD
     from ta.momentum import RSIIndicator
-    from ta.volatility import BollingerBands
+    from ta.volatility import BollingerBands, AverageTrueRange
     TA_AVAILABLE = True
 except ImportError:
     TA_AVAILABLE = False
-    print("Warning: 'pandas_ta' library not found. Using manual calculation fallback.")
+    print("Warning: 'ta' library not found. Install via: pip install ta")
+
 
 warnings.filterwarnings('ignore')
 
@@ -50,7 +51,8 @@ ASSET_CONFIG = {
     'AAPL': {'name': 'Apple Inc.', 'currency': '$', 'market': 'US', 'keywords': 'Apple Inc OR iPhone OR Tech Stocks'},
     'NVDA': {'name': 'NVIDIA Corp.', 'currency': '$', 'market': 'US', 'keywords': 'NVIDIA OR AI Chips OR GPU Market'},
     'TSLA': {'name': 'Tesla Inc.', 'currency': '$', 'market': 'US', 'keywords': 'Tesla OR Elon Musk OR EV Market'},
-    'BTC-USD': {'name': 'Bitcoin', 'currency': '$', 'market': 'CRYPTO', 'keywords': 'Bitcoin OR Cryptocurrency OR BTC'}
+    'BTC-USD': {'name': 'Bitcoin', 'currency': '$', 'market': 'CRYPTO', 'keywords': 'Bitcoin OR Cryptocurrency OR BTC'},
+    'SHRIRAMFIN.NS': {'name': 'Shriram Finance', 'currency': '₹', 'market': 'IN', 'keywords': 'Shriram Finance OR NBFC OR Shriram Transport'},
 }
 
 def get_asset_info(symbol):
@@ -216,6 +218,7 @@ HTML_TEMPLATE = """
                             <option value="AAPL" {% if symbol == 'AAPL' %}selected{% endif %}>Apple Inc (US)</option>
                             <option value="NVDA" {% if symbol == 'NVDA' %}selected{% endif %}>NVIDIA (US)</option>
                             <option value="TSLA" {% if symbol == 'TSLA' %}selected{% endif %}>Tesla (US)</option>
+                            <option value="SHRIRAMFIN.NS" {% if symbol == 'SHRIRAMFIN.NS' %}selected{% endif %}>Shriram Finance (India)</option>
                         </select>
                     </div>
                     <div class="input-group">
@@ -397,43 +400,118 @@ class UniversalPredictor:
 
         return df_intra
 
-    def engineer_features(self, df):
+    def calculate_vwap(self, df):
+        """Volume Weighted Average Price"""
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        return (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
+
+    def detect_market_regime(self, df):
+        """Identify volatility regime: 0=Low, 1=Normal, 2=High"""
+        rolling_vol = df['log_ret'].rolling(20).std()
+        # Use percentiles to determine regime dynamically
+        vol_percentile = rolling_vol.rank(pct=True)
+        
+        regime = pd.Series(1, index=df.index) # Default Normal
+        regime[vol_percentile < 0.33] = 0     # Low Vol
+        regime[vol_percentile > 0.67] = 2     # High Vol
+        return regime
+
+    def engineer_advanced_features(self, df):
+        """
+        Generates 50+ Alpha Factors. 
+        ROBUST VERSION: Uses fillna() instead of dropna() to prevent empty datasets.
+        """
         df = df.copy()
+        
+        # === 1. BASIC TRANSFORMATIONS ===
         df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-        
-        for lag in [1, 2, 3, 5, 10]:
+        df['hl_ratio'] = (df['high'] - df['low']) / df['close']
+        df['co_ratio'] = (df['close'] - df['open']) / df['open']
+        df['vol_change'] = df['volume'].pct_change()
+
+        # === 2. LAGGED FEATURES ===
+        for lag in [1, 2, 3, 5, 10, 20]:
             df[f'ret_lag_{lag}'] = df['log_ret'].shift(lag)
-            df[f'vol_lag_{lag}'] = df['volume'].shift(lag)
-        
+            df[f'vol_lag_{lag}'] = df['vol_change'].shift(lag)
+            df[f'price_dist_{lag}'] = (df['close'] / df['close'].shift(lag)) - 1
+
+        # === 3. ROLLING STATISTICS ===
+        for window in [5, 10, 20]:
+            df[f'ret_mean_{window}'] = df['log_ret'].rolling(window).mean()
+            df[f'ret_std_{window}'] = df['log_ret'].rolling(window).std()
+            df[f'vol_mean_{window}'] = df['volume'].rolling(window).mean()
+            ma = df['close'].rolling(window).mean()
+            df[f'ma_dist_{window}'] = (df['close'] - ma) / ma
+
+        # === 4. ADVANCED STATISTICS ===
+        df['ret_skew_20'] = df['log_ret'].rolling(20).skew()
+        df['ret_kurt_20'] = df['log_ret'].rolling(20).kurt()
+        df['autocorr_10'] = df['log_ret'].rolling(10).apply(lambda x: x.autocorr(lag=1) if len(x)>1 else 0, raw=False)
+
+        # === 5. MICROSTRUCTURE ===
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        df['vwap'] = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
+        df['vwap_dist'] = (df['close'] - df['vwap']) / df['vwap']
+        df['vol_price_corr'] = df['volume'].rolling(20).corr(df['close'])
+
+        # === 6. TIME ENCODING ===
         minutes = df.index.hour * 60 + df.index.minute
         df['time_sin'] = np.sin(2 * np.pi * minutes / 1440)
         df['time_cos'] = np.cos(2 * np.pi * minutes / 1440)
-        
-        if TA_AVAILABLE:
-            df['rsi'] = RSIIndicator(df['close'], window=14).rsi().shift(1)
-            ema = EMAIndicator(df['close'], window=50).ema_indicator()
-            df['ema_dist'] = (df['close'] - ema) / ema
-            bb = BollingerBands(df['close'], window=20)
-            df['bb_width'] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
-        else:
-            df['rsi'] = 50; df['ema_dist'] = 0; df['bb_width'] = 0
+        df['is_open'] = (minutes < (9*60 + 45)).astype(int) 
+        df['is_close'] = (minutes > (15*60)).astype(int)
 
-        return df.dropna()
+        # === 7. TECHNICAL INDICATORS ===
+        if TA_AVAILABLE:
+            try:
+                df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
+                bb = BollingerBands(df['close'], window=20)
+                df['bb_width'] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
+                df['bb_pos'] = (df['close'] - bb.bollinger_lband()) / (bb.bollinger_hband() - bb.bollinger_lband())
+                df['atr'] = AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
+            except Exception: pass
+
+        # === 8. REGIME DETECTION ===
+        rolling_vol = df['log_ret'].rolling(20).std()
+        vol_rank = rolling_vol.rank(pct=True)
+        df['regime'] = 1
+        df.loc[vol_rank < 0.33, 'regime'] = 0
+        df.loc[vol_rank > 0.67, 'regime'] = 2
+
+        # === 9. CLEANING (THE FIX) ===
+        # Instead of dropping, we fill forward, then backward, then 0.
+        df = df.replace([np.inf, -np.inf], np.nan)
+        df = df.fillna(method='ffill').fillna(method='bfill').fillna(0)
+        
+        return df
 
     def train_and_predict(self, date_str, start_time, mode):
+        # 1. Fetch Data
         raw_df = self.fetch_data(date_str)
-        full_df = self.engineer_features(raw_df)
+        if raw_df.empty:
+            raise ValueError(f"No data fetched for {self.symbol}. Market might be closed.")
+
+        # 2. Engineer Features
+        full_df = self.engineer_advanced_features(raw_df)
         
-        X = full_df.drop(['open','high','low','close','volume','log_ret'], axis=1)
-        y = full_df['log_ret'].shift(-1)
+        # 3. Drop Non-Feature Columns
+        drop_cols = ['open','high','low','close','volume','log_ret', 'vwap']
+        X = full_df.drop(columns=[c for c in drop_cols if c in full_df.columns], axis=1)
+        y = full_df['log_ret'].shift(-1) # Target
         
+        # 4. Filter Valid Rows
         valid_idx = ~(X.isna().any(axis=1) | y.isna())
         X_train, y_train = X[valid_idx], y[valid_idx]
         
+        if len(X_train) < 50:
+            raise ValueError(f"Insufficient training data. Only {len(X_train)} rows available.")
+        
+        # 5. Train Model
         self.model = LGBMRegressor(**self.params)
         self.model.fit(X_train, y_train)
         self.feature_cols = X_train.columns.tolist()
         
+        # 6. Prepare Simulation State
         target_dt = datetime.strptime(f"{date_str} {start_time}", "%Y-%m-%d %H:%M")
         
         if target_dt < raw_df.index[-1]:
@@ -441,32 +519,65 @@ class UniversalPredictor:
         else:
             current_state_df = raw_df.copy()
 
-        # Generate features for current state
-        current_state_df = self.engineer_features(current_state_df)
+        if current_state_df.empty:
+             raise ValueError(f"No data available before target time {target_dt}.")
+
+        # 7. Generate Predictions
+        # Recalculate features to ensure we have the latest state
+        current_state_df = self.engineer_advanced_features(current_state_df)
         
-        # Calculate recent volatility
         recent_volatility = current_state_df['log_ret'].tail(20).std()
         if np.isnan(recent_volatility) or recent_volatility == 0: recent_volatility = 0.0005 
             
         preds = []
-        steps = 6 if mode == '30' else 20 
+        
+        # === 🚀 DYNAMIC STEP CALCULATION ===
+        if mode == '30':
+            steps = 6  # Fixed 30 mins
+        else:
+            # Determine Close Time based on Market
+            market = self.info['market']
+            if market == 'IN':
+                close_time_str = "15:30"
+            elif market == 'US':
+                close_time_str = "16:00"
+            else:
+                close_time_str = "23:59" # Crypto runs all day
+
+            # Create full datetime object for market close on that specific date
+            market_close_dt = datetime.strptime(f"{date_str} {close_time_str}", "%Y-%m-%d %H:%M")
+            
+            # Calculate time remaining
+            time_diff = market_close_dt - target_dt
+            
+            # Convert to 5-minute chunks
+            # total_seconds / 300 (which is 5 mins * 60 secs)
+            calculated_steps = int(time_diff.total_seconds() / 300)
+            
+            # Safety: If user enters time AFTER market close, steps is 0. 
+            # If Crypto, limit to reasonable max (e.g., 200)
+            steps = max(0, calculated_steps)
+            if market == 'CRYPTO': steps = min(steps, 288) # Cap at 24 hours
+
         current_price = current_state_df['close'].iloc[-1]
         
         for i in range(steps):
-            feat_df = self.engineer_features(current_state_df)
-            last_row = feat_df[self.feature_cols].iloc[-1:].values
+            # We must re-engineer at each step
+            feat_df = self.engineer_advanced_features(current_state_df)
             
+            last_row = feat_df[self.feature_cols].iloc[-1:].values
             pred_log_ret = self.model.predict(last_row)[0]
             
-            # Monte Carlo Noise Injection
             noise = np.random.normal(0, recent_volatility)
             final_log_ret = pred_log_ret + noise
             
             next_price = current_price * np.exp(final_log_ret)
+            
+            # Calculate next timestamp
             next_time = current_state_df.index[-1] + timedelta(minutes=5)
             preds.append({'timestamp': next_time, 'price': next_price})
             
-            # Simulate Candle
+            # Simulate candle
             sim_high = next_price * (1 + (recent_volatility/2))
             sim_low = next_price * (1 - (recent_volatility/2))
 
