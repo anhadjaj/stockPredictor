@@ -446,7 +446,7 @@ class UniversalPredictor:
         # === 4. ADVANCED STATISTICS ===
         df['ret_skew_20'] = df['log_ret'].rolling(20).skew()
         df['ret_kurt_20'] = df['log_ret'].rolling(20).kurt()
-        df['autocorr_10'] = df['log_ret'].rolling(10).apply(lambda x: x.autocorr(lag=1) if len(x)>1 else 0, raw=False)
+        df['autocorr_10'] = df['log_ret'].rolling(10).corr(df['log_ret'].shift(1)).fillna(0)
 
         # === 5. MICROSTRUCTURE ===
         typical_price = (df['high'] + df['low'] + df['close']) / 3
