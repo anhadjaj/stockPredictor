@@ -53,6 +53,14 @@ ASSET_CONFIG = {
     'TSLA': {'name': 'Tesla Inc.', 'currency': '$', 'market': 'US', 'keywords': 'Tesla OR Elon Musk OR EV Market'},
     'BTC-USD': {'name': 'Bitcoin', 'currency': '$', 'market': 'CRYPTO', 'keywords': 'Bitcoin OR Cryptocurrency OR BTC'},
     'SHRIRAMFIN.NS': {'name': 'Shriram Finance', 'currency': '₹', 'market': 'IN', 'keywords': 'Shriram Finance OR NBFC OR Shriram Transport'},
+    'INDUSTOWER.NS': {'name': 'Indus Towers', 'currency': '₹', 'market': 'IN', 'keywords': 'Indus Towers OR Bharti Infratel OR Telecom Towers India'},
+    'SUZLON.NS': {
+    'name': 'Suzlon Energy',
+    'currency': '₹',
+    'market': 'IN',
+    'keywords': 'Suzlon Energy OR Suzlon Wind OR Wind Energy India OR Renewable Energy India'
+},
+
 }
 
 def get_asset_info(symbol):
@@ -219,6 +227,12 @@ HTML_TEMPLATE = """
                             <option value="NVDA" {% if symbol == 'NVDA' %}selected{% endif %}>NVIDIA (US)</option>
                             <option value="TSLA" {% if symbol == 'TSLA' %}selected{% endif %}>Tesla (US)</option>
                             <option value="SHRIRAMFIN.NS" {% if symbol == 'SHRIRAMFIN.NS' %}selected{% endif %}>Shriram Finance (India)</option>
+                            <option value="INDUSTOWER.NS" {% if symbol == 'INDUSTOWER.NS' %}selected{% endif %}>Indus Towers (India)</option>
+                            <option value="SUZLON.NS" {% if symbol == 'SUZLON.NS' %}selected{% endif %}>
+    Suzlon Energy (India)
+</option>
+
+
                         </select>
                     </div>
                     <div class="input-group">
@@ -446,7 +460,7 @@ class UniversalPredictor:
         # === 4. ADVANCED STATISTICS ===
         df['ret_skew_20'] = df['log_ret'].rolling(20).skew()
         df['ret_kurt_20'] = df['log_ret'].rolling(20).kurt()
-        df['autocorr_10'] = df['log_ret'].rolling(10).corr(df['log_ret'].shift(1)).fillna(0)
+        df['autocorr_10'] = df['log_ret'].rolling(10).apply(lambda x: x.autocorr(lag=1) if len(x)>1 else 0, raw=False)
 
         # === 5. MICROSTRUCTURE ===
         typical_price = (df['high'] + df['low'] + df['close']) / 3
@@ -481,7 +495,7 @@ class UniversalPredictor:
         # === 9. CLEANING (THE FIX) ===
         # Instead of dropping, we fill forward, then backward, then 0.
         df = df.replace([np.inf, -np.inf], np.nan)
-        df = df.fillna(method='ffill').fillna(method='bfill').fillna(0)
+        df = df.ffill().bfill().fillna(0)
         
         return df
 
@@ -496,12 +510,16 @@ class UniversalPredictor:
         
         # 3. Drop Non-Feature Columns
         drop_cols = ['open','high','low','close','volume','log_ret', 'vwap']
-        X = full_df.drop(columns=[c for c in drop_cols if c in full_df.columns], axis=1)
+        X = full_df.drop(columns=[c for c in drop_cols if c in full_df.columns])
         y = full_df['log_ret'].shift(-1) # Target
         
         # 4. Filter Valid Rows
         valid_idx = ~(X.isna().any(axis=1) | y.isna())
-        X_train, y_train = X[valid_idx], y[valid_idx]
+        X_all, y_all = X[valid_idx], y[valid_idx]
+
+        split_point = int(len(X_all) * 0.8)
+        X_train, X_test = X_all.iloc[:split_point], X_all.iloc[split_point:]
+        y_train, y_test = y_all.iloc[:split_point], y_all.iloc[split_point:]
         
         if len(X_train) < 50:
             raise ValueError(f"Insufficient training data. Only {len(X_train)} rows available.")
@@ -590,6 +608,44 @@ class UniversalPredictor:
             current_state_df = pd.concat([current_state_df, new_row])
             current_state_df['log_ret'] = current_state_df['log_ret'].fillna(0)
             current_price = next_price
+
+        # --- 📊 METRICS CALCULATION (Add before the final return) ---
+        
+        # We use the training results to see how the model performed on known data
+        test_preds = self.model.predict(X_test)
+
+# 2. Update these variable names to match:
+        dir_accuracy = np.mean(np.sign(test_preds) == np.sign(y_test))
+
+        # 3. Use test_preds and y_test for PnL
+        raw_returns = np.sign(test_preds) * y_test
+        n_trades = len(test_preds)
+        
+        # Adjust these constants based on your broker (e.g., Zerodha/Interactive Brokers)
+        slippage_pct = 0.0002   # 0.02% per trade
+        brokerage_flat = 20.0   # Flat fee per trade
+        est_trade_value = 100000 # Estimated position size for brokerage calc
+        
+        total_raw_return = raw_returns.sum()
+        total_costs = (n_trades * slippage_pct) + (n_trades * (brokerage_flat / est_trade_value))
+        net_pnl = total_raw_return - total_costs
+
+        # 3. Sharpe Ratio (Annualized for 5-minute data)
+        # 252 days * 75 five-minute intervals per day = 18,900
+        if raw_returns.std() != 0:
+            sharpe = np.sqrt(18900) * (raw_returns.mean() / raw_returns.std())
+        else:
+            sharpe = 0
+
+        # --- 🖥️ TERMINAL OUTPUT ---
+        print("\n" + "="*40)
+        print(f" STRATEGY BACKTEST: {self.symbol} | {date_str}")
+        print("="*40)
+        print(f" Directional Accuracy: {dir_accuracy:.2%}")
+        print(f" Net PnL (Post-Costs): {net_pnl:.4f}")
+        print(f" Annualized Sharpe:    {sharpe:.2f}")
+        print(f" Total Trades Evaluated: {n_trades}")
+        print("="*40 + "\n")
 
         return pd.DataFrame(preds), raw_df
 
